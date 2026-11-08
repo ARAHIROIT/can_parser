@@ -2,42 +2,54 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use serde::Deserialize;
 
+// 💡 【エラー解消の核心】Linux（OrbStack）のときだけ読み込むという条件（cfg）をコード側にも追加し、Mac側でのビルドエラーを100%完全に防ぎます！
+#[cfg(target_os = "linux")]
+use socketcan::{CanSocket, Socket, CanFrame, EmbeddedFrame}; 
+
 // =========================================================================
-// 🏢 組み込み実務対応の定数定義（マジックナンバーを排除し、仕様変更に強くする）
+// 🏢 定数定義（ロードマップの安全設計・フェールセーフ仕様）
 // =========================================================================
 const SPEED_LIMIT: f32 = 100.0;               // 速度超過を検知するための安全基準しきい値（100.0 km/h）
 const SHIFT_MASK_BITS: i32 = 0x03;            // 下位2ビット（シフト位置情報）を切り出すためのANDマスク値
 const REVERSE_SHIFT_BIT: i32 = 1;             // マスク後の値が「1」の時にR（リバース）レンジであると特定する基準値
 const BRAKE_ON_BIT: i32 = 0x01;               // 最下位ビット（ブレーキON/OFF）を抽出するためのANDマスク値（0x01）
-const SLEEP_DURATION_MS: u64 = 1000;          // 車載ネットワーク（ECU）のパケット周期を再現するウェイト時間（1秒）
+const SLEEP_DURATION_MS: u64 = 1000;          // 🟨【フェーズ2】1秒ごとにトントン自動パースするための周期タイマー（1000ms）
 
 // =========================================================================
-// 💡 【構造体の定義①】config.json の設定（仕様書）を格納するための箱
+// 💡 🟢【フェーズ1】config.json の設定（仕様書）を格納するための箱
 // =========================================================================
 #[derive(Deserialize, Debug)]
 struct CanConfig {
-    speed_index: usize,       // config.json内の "speed_index"（＝0：配列の0番目を読めという指示）
-    speed_gain: f32,          // config.json内の "speed_gain"（＝120.0：車速の足し算に使う補正値）
-    brake_index: usize,       // config.json内の "brake_index"（＝1：配列の1番目を読めという指示）
-    shift_bits_index: usize,  // config.json内の "shift_bits_index"（＝2：配列の2番目を読めという指示）
+    speed_index: usize,       // 配列0 (先頭): 車速データの場所
+    speed_gain: f32,          // 車速の足し算に使う補正値
+    brake_index: usize,       // 配列1 (真ん中): ブレーキ状態の場所
+    shift_bits_index: usize,  // 配列2 (一番右): シフトポジションの場所
 }
 
 // =========================================================================
-// 💡 【構造体の定義②】車両の状態を一括で保持・管理する実務仕様のフラグ箱
+// 💡 🟢【フェーズ1】車両の状態を一括で保持・管理（カプセル化）するフラグ構造体
 // =========================================================================
 struct VehicleStatus {
     speed_kmh: f32,               // 補正後の最終的な車速（km/h）
-    is_brake_on: bool,            // ブレーキがON（制動中）かどうかの真偽値
-    shift_position: &'static str, // 解析された現在のシフト位置の文字列（P, R, N, D）
+    is_brake_on: bool,            // ブレーキがONかどうかの真偽値
+    shift_position: &'static str, // 解析された現在のシフト位置の文字列
     is_speed_over: bool,           // 安全基準（100km/h）を超えているかどうかの判定フラグ
 }
 
 fn main() {
-    println!("=== リアルタイム通信解析システム (最上級プラン・完全体アピール版) ===");
-    println!("処理モード: ⏱️ 1秒周期自動ファイルストリーム ＆ 📊 早期例外ガードロジック");
+    println!("=== リアルタイム通信解析システム (最上級・全フェーズ融合ハイブリッド完全版) ===");
+    println!("処理モード: 📊 早期例外ガードロジック ＆ ロードマップ完全準拠仕様");
+
+    // =========================================================================
+    // 🎛️ 🟢 モード切り替えスイッチ（★ここに配置しました！）
+    // 初めての人がテストする際は、ここを直接書き換えてモードを切り替えます。
+    // false ➔ 【Aモード】can_log.txt のファイルを1秒ごとに「トントン」と自動で読み込みます
+    // true  ➔ 【Bモード】Linuxの回線（vcan0）から直接生データを吸い上げます
+    // =========================================================================
+    let use_real_can = false; 
 
     // -------------------------------------------------------------------------
-    // 📂 1. 仕様書ファイル（config.json）の読み込みとパース（構造体への格納）
+    // 📂 1. 🟢【フェーズ1】仕様書ファイル（config.json）の動的読み込み
     // -------------------------------------------------------------------------
     let config_file = File::open("config.json")
         .expect("[致命的エラー] 設定ファイル(config.json)が開けませんでした。");
@@ -45,118 +57,121 @@ fn main() {
     let config: CanConfig = serde_json::from_reader(config_reader)
         .expect("[致命的エラー] JSONのパース（解析）に失敗しました。");
 
-    // -------------------------------------------------------------------------
-    // 📂 2. 生の入力データファイル（can_log.txt）の読み込み開始
-    // -------------------------------------------------------------------------
-    let log_file = File::open("can_log.txt")
-        .expect("[致命的エラー] 疑似入力データ(can_log.txt)が開けませんでした。");
-    let log_reader = BufReader::new(log_file);
-
-    println!("can_log.txt の自動解析を開始します（1秒周期でログを下に蓄積）...");
-
-    // -------------------------------------------------------------------------
-    // 🔄 3. メイン処理ループ（can_log.txt を上から1行ずつリアルタイム風に自動パース）
-    // -------------------------------------------------------------------------
-    // 💡【ループの解説】`.lines()` でファイルを1行ずつ読み込みながら、
-    // 💡`.enumerate()` を合体させることで「現在のループが何周目か（0から始まる通し番号）」を
-    // 💡自動的にカウントし、変数 `index`（0, 1, 2...）に格納して同時に取得しています。
-    for (index, line) in log_reader.lines().enumerate() {
-        
-        // 💡【行番号の計算】プログラミングの世界（index）は「0」からスタートするため、
-        // 💡人間の目（画面表示）に分かりやすい「1行目、2行目...」に合わせるため、必ず `+ 1` を行っています。
-        let line_number = index + 1; 
-        
-        // 💡【安全対策】テキストから1行の文字を吸い上げる際、文字化けや予期せぬエラー（Err）が
-        // 💡起きた場合でもシステムを強制終了（クラッシュ）させず、次の行へ安全に進める（continue）ガード処理です。
-        let line_string = match line {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // 💡【ノイズ消去】ファイル内にデータが存在しない「完全に空っぽの行（空白行）」を
-        // 💡`.trim().is_empty()` で自動検知し、バグを起こさないよう安全に読み飛ばします。
-        if line_string.trim().is_empty() {
-            continue;
-        }
-
-        // 💡【文字列の配列化】can_log.txt の「20, 0, 3」といったカンマ区切りの文字列を、
-        // 💡`.split(',')` を使ってカンマの場所でブツブツと切り離し、配列（Vector）へ綺麗に整理格納します。
-        // 💡これを行うことで `packet[0]="20"`, `packet[1]="0"`, `packet[2]="3"` として個別に扱えるようになります。
-        let packet: Vec<&str> = line_string.split(',').map(|s| s.trim()).collect();
-        
-        // 💡【データ不足ガード】もしノイズやデータ欠損で、カンマで分けた個数が「3つ未満」しかなかった場合、
-        // 💡存在しない配列配列の領域（packet[2]など）を読み込もうとしてクラッシュするのを防ぐため、事前に無視します。
-        if packet.len() < 3 {
-            continue;
-        }
-
-        println!("\n---【パケットリアルタイム受信（レコード: {}）】---", line_number);
-
-        // 🚗 【パース処理①：車速の足し算補正】
-        // 💡 仕様書（config.speed_index = 0）の指示に従い、配列の0番目から車速の文字を数値に変換。
-        // 💡 `.unwrap_or(0)` を添えることで、万が一データにアルファベット等のゴミが混ざっていても安全に「0」を代入します。
-        let row_speed: i32 = packet[config.speed_index].parse().unwrap_or(0);
-        // 生データ（row_speed）に対して、仕様書の補正値である 120.0（config.speed_gain）を足し算（+）
-        let speed_kmh = row_speed as f32 + config.speed_gain; 
-
-        // 🛑 【パース処理②：ブレーキ状態の判定（C言語のビット演算）】
-        // 💡 仕様書（config.brake_index = 1）の指示に従い、配列の1番目からブレーキデータを数値に変換。
-        let brake_bit: i32 = packet[config.brake_index].parse().unwrap_or(0);
-        // 定数 BRAKE_ON_BIT(0x01) を使ってANDマスク演算を行い、最下位ビットが1（ON）か0（OFF）かを抽出
-        let is_brake_on = brake_bit & BRAKE_ON_BIT == 1;
-
-        // ⚙️ 【パース処理③：シフト位置の判定（C言語のビット演算 ＆ マッチングガード）】
-        // 💡 仕様書（config.shift_bits_index = 2）の指示に従い、配列の2番目からシフトデータを数値に変換。
-        let shift_bits: i32 = packet[config.shift_bits_index].parse().unwrap_or(0);
-        // 定数 SHIFT_MASK_BITS(0x03) で下位2ビットを切り出し、C言語の switch-case にあたる match 文で仕分け
-        let shift_position = match shift_bits & SHIFT_MASK_BITS {
-            0 => "P (パーキング)",
-            1 => "R (リバース)",       
-            2 => "N (ニュートラル)",
-            3 => "D (ドライブ)",
-            _ => "不明",
-        };
-
+    if use_real_can {
         // =========================================================================
-        // 💡 【状態構造体への一括集約：例外検出を高速化するフラグ設計】
+        // 🌐 🟦【Bモード】本物の SocketCAN 待ち受け無限ループ処理
         // =========================================================================
-        let status = VehicleStatus {
-            speed_kmh,
-            is_brake_on,
-            shift_position,
-            is_speed_over: speed_kmh > SPEED_LIMIT, // 基準の100km/hを超えていたら自動的にtrueフラグが立つ
-        };
+        #[cfg(target_os = "linux")]
+        {
+            let socket = CanSocket::open("vcan0")
+                .expect("[エラー] Linuxの vcan0 回線が開けませんでした。OrbStackを確認してください。");
 
-        // 📊 画面へのリアルタイムインジケータ出力
-        println!("📈 現在の車速: {:.0} km/h", status.speed_kmh);
-        println!("🛑 ブレーキ状態: {}", if status.is_brake_on { "ON (制動中)" } else { "OFF" });
-        println!("⚙️ 現在のシフト: {}", status.shift_position);
+            println!("【最上級モード】Linux回線「vcan0」に接続。生のパケット電気信号を常時待ち受け中...");
 
-        // =========================================================================
-        // 🚨 【ビジネスロジック：異常（ガード処理）を先頭に据えた美しい分岐処理】
-        // 🛠️ 設計思想補足：実務でこの順番が選ばれる理由
-        // 自動車開発ではコードの「複雑度（ネストの深さ）」を極限まで下げる静的解析規格が
-        // 存在します。例外・異常系を先頭で即座に検知・処理（早期ガード）することで、
-        // 奥に進むコードの可読性を高め、バグを未然に防ぐ現代的なフェールセーフ思想です。
-        // =========================================================================
-        if status.is_speed_over {
-            // 🔴 【異常ルート】速度超過（true）が起きた際の緊急防衛ロジック
-            // 「高速域（100km/h超）でさらにRレンジ（1）」かつ「ブレーキがON（1）」という
-            // 通常ありえない2つの条件が同時に重なった『緊急回避アクション』であるかを複合判定
-            if (shift_bits & SHIFT_MASK_BITS) == REVERSE_SHIFT_BIT && status.is_brake_on {
-                println!("[情報] 危険回避アラート：高速域でのRレンジ切り替えを検知。ブレーキ作動中につき安全です。");
-            } else {
-                // ブレーキを踏んでいない、純粋な速度超過に対する警告
-                println!("[警告] 速度超過（安全基準: {}km/h超）！減速してください。", SPEED_LIMIT);
+            loop {
+                if let Ok(frame) = socket.read_frame() {
+                    let packet: &[u8] = match &frame {
+                        CanFrame::Data(data_frame) => data_frame.data(),
+                        _ => continue, 
+                    };
+
+                    if packet.len() < 3 { continue; }
+
+                    let row_speed: i32 = packet[config.speed_index] as i32; 
+                    let speed_kmh = row_speed as f32 + config.speed_gain;  
+
+                    let brake_bit: i32 = packet[config.brake_index] as i32; 
+                    let is_brake_on = brake_bit & BRAKE_ON_BIT == 1;       
+
+                    let shift_bits: i32 = packet[config.shift_bits_index] as i32; 
+                    let shift_position = match shift_bits & SHIFT_MASK_BITS {    
+                        0 => "P (パーキング)",
+                        1 => "R (リバース)",       
+                        2 => "N (ニュートラル)",
+                        3 => "D (ドライブ)",       
+                        _ => "未定義（不正データ）", 
+                    };
+
+                    analyze_and_print(speed_kmh, is_brake_on, shift_position, shift_bits, 0);
+                }
             }
-        } else {
-            // 🟢 【正常ルート】安全（false）のままであれば、不要な処理をスキップして正常ログへ流す
-            println!("[STATUS] 車両状態は正常です。安全運転が維持されています。");
         }
+        #[cfg(not(target_os = "linux"))]
+        {
+            println!("[通知] 本モードはLinux環境専用です。");
+        }
+    } else {
+        // =========================================================================
+        // 📄 🟨【Aモード】一括で取り込んだログファイルを1行ずつ安全に解析（完全保存版）
+        // =========================================================================
+        let log_file = File::open("can_log.txt")
+            .expect("[致命的エラー] can_log.txt が開けませんでした。");
+        let log_reader = BufReader::new(log_file);
 
-        // ⏱️ 4. 車両ECUの通信周期再現（1行処理するたびにその場でピタッと1秒待機）
-        std::thread::sleep(std::time::Duration::from_millis(SLEEP_DURATION_MS));
+        println!("【ファイルモード】can_log.txt のデータを1秒周期で自動パース中...");
+
+        for (index, line) in log_reader.lines().enumerate() {
+            let line_number = index + 1; 
+            
+            let line_string = match line {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if line_string.trim().is_empty() { continue; }
+
+            let packet: Vec<&str> = line_string.split(',').map(|s| s.trim()).collect();
+            if packet.len() < 3 { continue; }
+
+            let row_speed: i32 = packet[config.speed_index].parse().unwrap_or(0); 
+            let speed_kmh = row_speed as f32 + config.speed_gain;                 
+
+            let brake_bit: i32 = packet[config.brake_index].parse().unwrap_or(0); 
+            let is_brake_on = brake_bit & BRAKE_ON_BIT == 1;
+
+            let shift_bits: i32 = packet[config.shift_bits_index].parse().unwrap_or(0); 
+            let shift_position = match shift_bits & SHIFT_MASK_BITS {
+                0 => "P (パーキング)",
+                1 => "R (リバース)",       
+                2 => "N (ニュートラル)",
+                3 => "D (ドライブ)",
+                _ => "未定義（不正データ）",
+            };
+
+            analyze_and_print(speed_kmh, is_brake_on, shift_position, shift_bits, line_number);
+            std::thread::sleep(std::time::Duration::from_millis(SLEEP_DURATION_MS));
+        }
     }
-    
-    println!("\n=== ロードマップの全要件を100%クリアし、完全体システムが構築されました ===");
+}
+
+// =========================================================================
+// 🚨 🟢【フェーズ1】異常系先行ガード処理（高速域でのRレンジ誤進入を最優先でキャッチ）
+// =========================================================================
+fn analyze_and_print(speed_kmh: f32, is_brake_on: bool, shift_position: &'static str, shift_bits: i32, line_number: usize) {
+    let status = VehicleStatus {
+        speed_kmh,
+        is_brake_on,
+        shift_position,
+        is_speed_over: speed_kmh > SPEED_LIMIT,
+    };
+
+    if line_number > 0 {
+        println!("\n---【パケットファイル受信（レコード: {}）】---", line_number);
+    } else {
+        println!("\n---【本物CANパケット受信検知】---");
+    }
+
+    println!("📈 現在の車速: {:.0} km/h", status.speed_kmh);
+    println!("🛑 ブレーキ状態: {}", if status.is_brake_on { "ON (制動中)" } else { "OFF" });
+    println!("⚙️ 現在のシフト: {}", status.shift_position);
+
+    if status.is_speed_over {
+        if (shift_bits & SHIFT_MASK_BITS) == REVERSE_SHIFT_BIT && status.is_brake_on {
+            println!("[情報] 危険回避アラート：高速域でのRレンジ切り替えを検知。ブレーキ作動中につき安全です。");
+        } else {
+            println!("[警告] 速度超過（安全基準: {}km/h超）！減速してください。", SPEED_LIMIT);
+        }
+    } else {
+        println!("[STATUS] 車両状態は正常です。");
+    }
 }
